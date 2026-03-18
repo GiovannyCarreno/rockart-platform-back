@@ -1,0 +1,28 @@
+# Entorno virtual
+.venv
+venv
+env
+
+# Cache de Python
+__pycache__
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Documentación y otros
+README.md
+LICENSE.txt
+*.md
+
+# El directorio modelo/ SÍ se incluye (contiene pictos512.pkl)
