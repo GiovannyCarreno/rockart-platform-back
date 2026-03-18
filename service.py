@@ -21,9 +21,13 @@ warnings.filterwarnings("ignore")
 
 app = FastAPI()
 
+origins = [
+    "http://localhost:5173"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite cualquier origen
+    allow_origins=origins,  # Solo este origen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
