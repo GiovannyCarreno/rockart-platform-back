@@ -48,7 +48,7 @@ RUTA_FONDO     = PROJECT_ROOT / "roca/roca_3.jpg"
 ONNX_MODEL_PATH = PROJECT_ROOT / "modelo/mejor_modelo_dinamico.onnx"
 
 RESOLUTIONS    = [256, 512]          # las dos resoluciones a comparar
-MASK_THRESHOLD = 0.8                 # mismo threshold para ambas
+MASK_THRESHOLD = 0.7                 # mismo threshold para ambas
 OVERLAY_ALPHA  = 0.3
 
 G = None
@@ -209,7 +209,7 @@ def inferir_y_simular_onnx(img_rgb: np.ndarray, img_size: int,
                                             color_objetivo=(0.35, 0.30, 0.80))
     resultado_final = simular_desgaste_poroso(resultado_pil, mascara_np, fondo_pil,
                                                intensidad_desgaste=0.50,
-                                               intensidad_porosidad=0.30,
+                                               intensidad_porosidad=0.10,
                                                intensidad_rugosidad=0.25,
                                                seed=42)
     cobertura = mask_bin.mean() * 100

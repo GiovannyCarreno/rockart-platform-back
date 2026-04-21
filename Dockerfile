@@ -24,6 +24,7 @@ COPY service.py .
 COPY dnnlib/ ./dnnlib/
 COPY torch_utils/ ./torch_utils/
 COPY modelo/ ./modelo/
+COPY roca/ ./roca/
 
 EXPOSE 8000
 
