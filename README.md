@@ -1,29 +1,41 @@
-# API de Generación de Imágenes con StyleGAN2
+# API pic-generator-back
 
-Servicio REST basado en FastAPI para generar imágenes usando un modelo StyleGAN2 entrenado (pictos512). El proyecto utiliza PyTorch y la arquitectura StyleGAN2 con Adaptive Discriminator Augmentation (ADA) de NVIDIA.
+Servicio REST con **FastAPI** que combina:
+
+1. **Generación de pictogramas** con **StyleGAN2 (ADA)** y el checkpoint `pictos512.pkl` (PyTorch).
+2. **Segmentación y simulación visual** con un modelo en **ONNX** a dos resoluciones (256×256 y 512×512), útil para comparar cobertura y resultado sobre un fondo de referencia.
 
 ## Características
 
-- **Generación única**: Produce una imagen a partir de una semilla (seed) específica
-- **Generación múltiple**: Genera varias imágenes con semillas aleatorias en una sola petición
-- **Configurable**: Parámetros de truncación y modo de ruido ajustables
-- **GPU acelerado**: Usa CUDA automáticamente si está disponible
+- **POST `/generateSingle`**: una imagen generada a partir de una **semilla** fija.
+- **POST `/generateSeveral`**: varias imágenes con **semillas aleatorias** en una sola petición.
+- **POST `/comparar`**: sube una imagen (`multipart/form-data`) y devuelve métricas de cobertura y PNG en base64 (comparación 256 vs 512, máscaras y simulaciones).
+- **GPU**: PyTorch (GAN) y **ONNX Runtime** usan CUDA cuando está disponible.
+- **CORS** configurado para `http://localhost:5174` (ajústalo en `service.py` si tu front usa otro origen).
 
 ## Requisitos previos
 
-- Python 3.8 o superior
-- CUDA (opcional, para aceleración con GPU)
-- Modelo preentrenado en `modelo/pictos512.pkl`
+- **Python 3.10+** recomendado (el `requirements.txt` fija versiones concretas; en Windows suele usarse un venv dedicado).
+- **CUDA** opcional para el GAN y para ONNX GPU (`onnxruntime-gpu`).
+- Archivos presentes antes de arrancar (o montados en Docker):
+  - `modelo/pictos512.pkl` — StyleGAN2.
+  - `modelo/mejor_modelo_dinamico.onnx` — segmentación.
+  - `roca/roca_3.jpg` — imagen de fondo usada en la simulación.
+
+### Repositorio con Git LFS
+
+Los pesos en `modelo/` pueden estar versionados con **Git LFS**. Tras clonar:
+
+```bash
+git lfs install
+git lfs pull
+```
 
 ## Instalación
 
-1. **Clonar o descargar el proyecto** y entrar en el directorio:
+1. Entrar en el directorio del proyecto (por ejemplo la carpeta `version 3`).
 
-```bash
-cd version 3
-```
-
-2. **Crear un entorno virtual** (recomendado):
+2. Crear y activar un entorno virtual:
 
 ```bash
 python -m venv .venv
@@ -31,67 +43,55 @@ python -m venv .venv
 # source .venv/bin/activate  # Linux/macOS
 ```
 
-3. **Instalar dependencias**:
+3. Instalar dependencias:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-4. **Verificar el modelo**: Asegúrate de que el archivo del modelo esté en `modelo/pictos512.pkl`. Puedes ajustar la ruta en `service.py` (línea 53) si usas otra ubicación.
+> En CPU sin NVIDIA puedes instalar solo `onnxruntime` y omitir el paquete GPU según tu entorno; el código intenta `CUDAExecutionProvider` y cae a CPU si no está.
 
-## Ejecución con Docker
+Las rutas de modelo y fondo se definen en `service.py` (`ONNX_MODEL_PATH`, `RUTA_FONDO` y carga del `.pkl` en el evento `startup`).
 
-Si prefieres ejecutar el proyecto en un contenedor, necesitas [Docker](https://docs.docker.com/get-docker/) instalado y, para GPU, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
-
-### Construir la imagen
-
-```bash
-docker build -t pictos-gan-api .
-```
-
-> **Nota**: Asegúrate de tener el archivo `modelo/pictos512.pkl` en la carpeta del proyecto antes del build.
-
-### Ejecutar el contenedor
-
-**Con GPU (recomendado):**
-```bash
-docker run --gpus all -p 8000:8000 pictos-gan-api
-```
-
-**Solo CPU:**
-```bash
-docker run -p 8000:8000 pictos-gan-api
-```
-
-**Montar el modelo como volumen** (si no está incluido en la imagen):
-```bash
-docker run --gpus all -p 8000:8000 -v ./modelo:/app/modelo pictos-gan-api
-```
-
-El servidor quedará disponible en `http://localhost:8000`.
-
-## Uso
-
-### Iniciar el servidor
+## Ejecución local
 
 ```bash
 uvicorn service:app --reload --host 0.0.0.0 --port 8000
 ```
 
-El servidor estará disponible en `http://localhost:8000`.
+Documentación interactiva: **http://localhost:8000/docs**
 
-### Documentación interactiva
+## Docker
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+Requisitos: [Docker](https://docs.docker.com/get-docker/) y, para GPU, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
-## Endpoints de la API
+Construir (incluye `modelo/` y `roca/` en la imagen):
+
+```bash
+docker build -t pictos-gan-api .
+```
+
+Ejecutar:
+
+```bash
+# Con GPU
+docker run --gpus all -p 8000:8000 pictos-gan-api
+
+# Solo CPU
+docker run -p 8000:8000 pictos-gan-api
+```
+
+Montar modelos o fondo desde el host si no van dentro de la imagen:
+
+```bash
+docker run --gpus all -p 8000:8000 -v ./modelo:/app/modelo -v ./roca:/app/roca pictos-gan-api
+```
+
+## Endpoints
 
 ### POST `/generateSingle`
 
-Genera una única imagen con los parámetros indicados.
-
-**Cuerpo de la petición (JSON):**
+Cuerpo JSON (ejemplo):
 
 ```json
 {
@@ -102,82 +102,51 @@ Genera una única imagen con los parámetros indicados.
 }
 ```
 
-| Parámetro        | Tipo   | Default  | Descripción                                      |
-|------------------|--------|----------|--------------------------------------------------|
-| seed             | float  | 456      | Semilla para reproducibilidad                    |
-| truncation_psi   | float  | 1.0      | Factor de truncación (afecta la variación)       |
-| noise_mode       | string | "const"  | Modo de ruido: `"const"`, `"random"`, `"none"`   |
-| number           | int    | 1        | (No usado en este endpoint)                      |
+| Parámetro        | Tipo   | Default  | Descripción |
+|------------------|--------|----------|-------------|
+| `seed`           | number | 456      | Semilla (se convierte a entero internamente). |
+| `truncation_psi` | float  | 1.0      | Truncación StyleGAN2. |
+| `noise_mode`     | string | `"const"`| `"const"`, `"random"` o `"none"`. |
+| `number`         | int    | 1        | No aplica a este endpoint. |
 
-**Respuesta:**
-
-```json
-{
-  "image": "<base64_encoded_png>",
-  "seed": 456,
-  "truncation_psi": 1.0,
-  "noise_mode": "const"
-}
-```
+Respuesta: `image` (PNG en base64), `seed`, `truncation_psi`, `noise_mode`.
 
 ### POST `/generateSeveral`
 
-Genera varias imágenes con semillas aleatorias.
+Mismo esquema de cuerpo; **`number`** es la cantidad de imágenes (por defecto `1`). Las semillas se eligen al azar por imagen.
 
-**Cuerpo de la petición (JSON):**
+Respuesta: `images`, `seeds`, `number`, `truncation_psi`, `noise_mode`.
 
-```json
-{
-  "seed": 456,
-  "truncation_psi": 1.0,
-  "noise_mode": "const",
-  "number": 5
-}
-```
+### POST `/comparar`
 
-| Parámetro        | Tipo   | Descripción                                 |
-|------------------|--------|---------------------------------------------|
-| number           | int    | **Requerido.** Cantidad de imágenes a generar |
-| truncation_psi   | float  | Factor de truncación                        |
-| noise_mode       | string | Modo de ruido                               |
+- **Entrada**: `multipart/form-data`, campo de archivo **`imagen`** (`png`, `jpg`, `jpeg`, `bmp`, `webp`).
+- **Salida** (JSON):
+  - `metricas`: `cobertura_modelo_1` / `cobertura_modelo_2` (256 vs 512), umbrales usados.
+  - `imagenes`: `comparacion` (figura 2×3 en base64), `simulacion_modelo_1`, `simulacion_modelo_2`.
 
-**Respuesta:**
-
-```json
-{
-  "number": 5,
-  "images": ["<base64_1>", "<base64_2>", ...],
-  "seeds": [123456, 789012, ...],
-  "truncation_psi": 1.0,
-  "noise_mode": "const"
-}
-```
-
-## Ejemplo de uso con cURL
+Ejemplo con **cURL**:
 
 ```bash
-# Generar una imagen con semilla fija
-curl -X POST "http://localhost:8000/generateSingle" \
-  -H "Content-Type: application/json" \
-  -d '{"seed": 12345}'
-
-# Generar 3 imágenes
-curl -X POST "http://localhost:8000/generateSeveral" \
-  -H "Content-Type: application/json" \
-  -d '{"number": 3}'
+curl -X POST "http://localhost:8000/comparar" \
+  -F "imagen=@ruta/a/tu/imagen.png"
 ```
+
+En el repo, `client.py` es un ejemplo mínimo que llama a `/comparar` y muestra las imágenes.
 
 ## Estructura del proyecto
 
 ```
 version 3/
-├── service.py        # Servidor FastAPI principal
-├── legacy.py         # Carga de modelos StyleGAN2
-├── dnnlib/           # Librería interna de StyleGAN2
-├── torch_utils/      # Utilidades PyTorch
-├── modelo/           # Carpeta para el modelo (.pkl)
-├── Dockerfile        # Definición de la imagen Docker
-├── .dockerignore     # Archivos excluidos al construir la imagen
+├── service.py          # FastAPI: arranque, GAN, ONNX, /comparar
+├── legacy.py           # Carga del .pkl StyleGAN2
+├── client.py           # Ejemplo de cliente para /comparar
+├── dnnlib/             # Utilidades StyleGAN2
+├── torch_utils/        # Utilidades PyTorch (StyleGAN2)
+├── modelo/             # pictos512.pkl, mejor_modelo_dinamico.onnx
+├── roca/               # Recursos de fondo (p. ej. roca_3.jpg)
+├── Dockerfile
+├── .dockerignore
+├── .gitattributes      # Reglas Git LFS para *.pkl, *.onnx, etc.
 ├── requirements.txt
 ├── LICENSE.txt
 └── README.md
@@ -185,11 +154,10 @@ version 3/
 
 ## Tecnologías
 
-- **FastAPI** – Framework web
-- **PyTorch** – Motor de inferencia
-- **StyleGAN2 (ADA)** – Arquitectura del modelo
-- **PIL/Pillow** – Procesamiento de imágenes
+- **FastAPI** / **Uvicorn** — API HTTP.
+- **PyTorch** — inferencia del generador StyleGAN2.
+- **ONNX Runtime** — segmentación dinámica (GPU/CPU según instalación).
+- **OpenCV**, **Pillow**, **NumPy**, **SciPy** — imagen y postprocesado.
+- **Matplotlib** — figura de comparación en `/comparar`.
 
-## Licencia
-
-Este proyecto utiliza código bajo la [NVIDIA Source Code License for StyleGAN2 ADA](LICENSE.txt).
+Código y modelo GAN sujetos a la licencia de **StyleGAN2 ADA**; ver `LICENSE.txt`.
