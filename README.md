@@ -60,8 +60,6 @@ Las rutas de modelo y fondo se definen en `service.py` (`ONNX_MODEL_PATH`, `RUTA
 uvicorn service:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Documentación interactiva: **http://localhost:8000/docs**
-
 ## Docker
 
 Requisitos: [Docker](https://docs.docker.com/get-docker/) y, para GPU, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).

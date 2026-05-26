@@ -1,7 +1,6 @@
 import io
 import base64
-from typing import List, Optional
-import os
+from typing import List, Literal, Optional
 import numpy as np
 import torch
 import PIL.Image
@@ -20,7 +19,7 @@ from pathlib import Path
 import cv2
 import matplotlib
 matplotlib.use("Agg")
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import onnxruntime as ort
 import tensorflow as tf
@@ -45,15 +44,24 @@ app.add_middleware(
 # =========
 PROJECT_ROOT   = Path(".")
 RUTA_FONDO     = PROJECT_ROOT / "roca/roca_3.jpg"
-ONNX_MODEL_PATH = PROJECT_ROOT / "modelo/mejor_modelo_dinamico.onnx"
+
+ONNX_MODEL_PATHS = {
+    "mejor_modelo_dinamico": PROJECT_ROOT / "modelo/mejor_modelo_dinamico.onnx",
+    "modelo_dinamico_gab": PROJECT_ROOT / "modelo/modelo_dinamico_gab.onnx",
+}
+OnnxModelName = Literal["mejor_modelo_dinamico", "modelo_dinamico_gab"]
 
 RESOLUTIONS    = [256, 512]          # las dos resoluciones a comparar
 MASK_THRESHOLD = 0.7                 # mismo threshold para ambas
 OVERLAY_ALPHA  = 0.3
 
-G = None
-onnx_session = None                  # sesión ONNX compartida
-onnx_input_name = None
+MODEL_PATHS = {
+    "pictos512": PROJECT_ROOT / "modelo/pictos512.pkl",
+    "pictos512_2": PROJECT_ROOT / "modelo/pictos512_2.pkl",
+}
+G_models: dict[str, torch.nn.Module | None] = {name: None for name in MODEL_PATHS}
+onnx_sessions: dict[str, ort.InferenceSession | None] = {name: None for name in ONNX_MODEL_PATHS}
+onnx_input_names: dict[str, str | None] = {name: None for name in ONNX_MODEL_PATHS}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -66,14 +74,51 @@ class Image(BaseModel):
     truncation_psi: float = 1.0
     noise_mode: str = 'const'
     number: Optional[int] = 1
+    model: Literal["pictos512", "pictos512_2"] = "pictos512"
 
-def load_model(model_path: str):
-    global G
-    if not os.path.isfile(model_path):
+def load_model(model_path: Path) -> torch.nn.Module:
+    if not model_path.is_file():
         raise FileNotFoundError(f"Modelo no encontrado en: {model_path}")
     with open(model_path, 'rb') as f:
-        G_local = legacy.load_network_pkl(f)['G_ema'].to(device)
-    return G_local
+        return legacy.load_network_pkl(f)['G_ema'].to(device)
+
+def get_generator(model_name: str) -> torch.nn.Module:
+    if model_name not in MODEL_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Modelo no válido. Use uno de: {list(MODEL_PATHS.keys())}",
+        )
+    G = G_models.get(model_name)
+    if G is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Modelo '{model_name}' no cargado",
+        )
+    return G
+
+def load_onnx_session(model_path: Path) -> tuple[ort.InferenceSession, str]:
+    providers = ort.get_available_providers()
+    session = ort.InferenceSession(
+        str(model_path),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if "CUDAExecutionProvider" in providers else ["CPUExecutionProvider"],
+    )
+    return session, session.get_inputs()[0].name
+
+def get_onnx_session(model_name: str) -> tuple[ort.InferenceSession, str]:
+    if model_name not in ONNX_MODEL_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Modelo ONNX no válido. Use uno de: {list(ONNX_MODEL_PATHS.keys())}",
+        )
+    session = onnx_sessions.get(model_name)
+    input_name = onnx_input_names.get(model_name)
+    if session is None or input_name is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Modelo ONNX '{model_name}' no cargado",
+        )
+    return session, input_name
 
 # =========
 # Utilidades generales
@@ -174,12 +219,13 @@ def simular_desgaste_poroso(resultado_pil, mascara_np, fondo_pil,
 # Pipeline ONNX  (reemplaza inferir_y_simular con Keras)
 # =========
 def inferir_y_simular_onnx(img_rgb: np.ndarray, img_size: int,
-                            threshold: float, label: str):
+                            threshold: float, label: str,
+                            model_name: str):
     """
     Misma firma de salida que el inferir_y_simular original:
         mask_bin (np.uint8 H×W), resultado_final (PIL.Image), cobertura (float)
     """
-    global onnx_session, onnx_input_name
+    onnx_session, onnx_input_name = get_onnx_session(model_name)
     h_orig, w_orig = img_rgb.shape[:2]
 
     # ── Inferencia ONNX ───────────────────────────────────────────────────
@@ -221,31 +267,32 @@ def inferir_y_simular_onnx(img_rgb: np.ndarray, img_size: int,
 # =========
 @app.on_event("startup")
 async def startup_event():
-    global G, onnx_session, onnx_input_name
+    global G_models, onnx_sessions, onnx_input_names
 
-    # GAN (sin cambios)
-    print("Cargando modelo GAN desde modelo/pictos512.pkl ...")
-    try:
-        G = load_model("modelo/pictos512.pkl")
-        print("Modelo GAN cargado correctamente.")
-    except Exception as e:
-        print(f"Error cargando el modelo GAN: {e}")
+    for name, path in MODEL_PATHS.items():
+        print(f"Cargando modelo GAN '{name}' desde {path} ...")
+        try:
+            G_models[name] = load_model(path)
+            print(f"Modelo GAN '{name}' cargado correctamente.")
+        except Exception as e:
+            print(f"Error cargando el modelo GAN '{name}': {e}")
 
-    # Validar archivos necesarios
-    for p in [ONNX_MODEL_PATH, RUTA_FONDO]:
-        if not Path(p).is_file():
-            raise FileNotFoundError(f"No existe el archivo: {p}")
+    if not RUTA_FONDO.is_file():
+        raise FileNotFoundError(f"No existe el archivo: {RUTA_FONDO}")
 
-    # Sesión ONNX  (GPU si está disponible)
     providers = ort.get_available_providers()
-    onnx_session = ort.InferenceSession(
-        str(ONNX_MODEL_PATH),
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        if "CUDAExecutionProvider" in providers else ["CPUExecutionProvider"]
-    )
-    onnx_input_name = onnx_session.get_inputs()[0].name
-    print(f"✅ Modelo ONNX cargado | input: '{onnx_input_name}' | "
-          f"{'GPU' if 'CUDAExecutionProvider' in providers else 'CPU'}")
+    device_label = "GPU" if "CUDAExecutionProvider" in providers else "CPU"
+    for name, path in ONNX_MODEL_PATHS.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"No existe el archivo: {path}")
+        print(f"Cargando modelo ONNX '{name}' desde {path} ...")
+        try:
+            session, input_name = load_onnx_session(path)
+            onnx_sessions[name] = session
+            onnx_input_names[name] = input_name
+            print(f"Modelo ONNX '{name}' cargado | input: '{input_name}' | {device_label}")
+        except Exception as e:
+            print(f"Error cargando el modelo ONNX '{name}': {e}")
 
 # =========
 # Endpoints GAN  (sin cambios)
@@ -255,24 +302,21 @@ async def generate_image(image: Image):
     seed = int(image.seed)
     truncation_psi = image.truncation_psi
     noise_mode = image.noise_mode
-    global G
-    if G is None:
-        raise HTTPException(status_code=500, detail="Modelo no cargado")
+    G = get_generator(image.model)
     label = torch.zeros([1, G.c_dim], device=device)
     z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
     img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
     img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
     pil_img = PIL.Image.fromarray(img[0].cpu().numpy(), "RGB")
     return {"image": img_to_b64(pil_img), "seed": seed,
-            "truncation_psi": truncation_psi, "noise_mode": noise_mode}
+            "truncation_psi": truncation_psi, "noise_mode": noise_mode,
+            "model": image.model}
 
 @app.post("/generateSeveral")
 async def generate_several(image: Image):
     truncation_psi = image.truncation_psi
     noise_mode = image.noise_mode
-    global G
-    if G is None:
-        raise HTTPException(status_code=500, detail="Modelo no cargado")
+    G = get_generator(image.model)
     label = torch.zeros([1, G.c_dim], device=device)
     images, seeds = [], []
     for _ in range(image.number):
@@ -284,13 +328,17 @@ async def generate_several(image: Image):
         images.append(img_to_b64(pil_img))
         seeds.append(seed)
     return {"number": image.number, "images": images, "seeds": seeds,
-            "truncation_psi": truncation_psi, "noise_mode": noise_mode}
+            "truncation_psi": truncation_psi, "noise_mode": noise_mode,
+            "model": image.model}
 
 # =========
 # /comparar  — ahora compara 256×256 vs 512×512 con el modelo ONNX
 # =========
 @app.post("/comparar")
-async def comparar_modelos(imagen: UploadFile = File(...)):
+async def comparar_modelos(
+    imagen: UploadFile = File(...),
+    model: OnnxModelName = Form("mejor_modelo_dinamico"),
+):
     nombre = imagen.filename or ""
     if not nombre.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
         raise HTTPException(status_code=400,
@@ -307,9 +355,11 @@ async def comparar_modelos(imagen: UploadFile = File(...)):
 
     # ── Inferencia con ambas resoluciones ────────────────────────────────
     mask_1, resultado_1, cob_1 = inferir_y_simular_onnx(
-        img_rgb, img_size=256, threshold=MASK_THRESHOLD, label="256×256")
+        img_rgb, img_size=256, threshold=MASK_THRESHOLD, label="256×256",
+        model_name=model)
     mask_2, resultado_2, cob_2 = inferir_y_simular_onnx(
-        img_rgb, img_size=512, threshold=MASK_THRESHOLD, label="512×512")
+        img_rgb, img_size=512, threshold=MASK_THRESHOLD, label="512×512",
+        model_name=model)
 
     # ── Figura comparación 2×3  (layout idéntico al original) ────────────
     fig1, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -322,13 +372,14 @@ async def comparar_modelos(imagen: UploadFile = File(...)):
     axes[1, 1].imshow(mask_2, cmap="gray"); axes[1, 1].set_title(f"Máscara — 512×512 ({cob_2:.1f}%)");     axes[1, 1].axis("off")
     axes[1, 2].imshow(resultado_2);         axes[1, 2].set_title("Simulación — 512×512");                   axes[1, 2].axis("off")
 
-    fig1.suptitle("Comparación de resoluciones de segmentación (modelo ONNX)",
+    fig1.suptitle(f"Comparación de resoluciones — {model}",
                   fontsize=15, fontweight="bold")
     plt.tight_layout()
     img_comparacion = fig_to_base64(fig1)
 
     # ── Respuesta JSON  (mismas claves que el endpoint original) ─────────
     return JSONResponse(content={
+        "model": model,
         "metricas": {
             "cobertura_modelo_1": round(cob_1, 4),   # resolución 256
             "cobertura_modelo_2": round(cob_2, 4),   # resolución 512
