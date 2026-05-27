@@ -24,6 +24,9 @@ from fastapi.responses import JSONResponse
 import onnxruntime as ort
 import tensorflow as tf
 from scipy.ndimage import gaussian_filter, distance_transform_edt
+import segmentar_petroglifo as petroglyph
+import timm
+from torchvision import transforms
 
 warnings.filterwarnings("ignore")
 
@@ -44,6 +47,7 @@ app.add_middleware(
 # =========
 PROJECT_ROOT   = Path(".")
 RUTA_FONDO     = PROJECT_ROOT / "roca/roca_3.jpg"
+RUTA_FONDO_GAB = PROJECT_ROOT / "roca/roca_5.jpg"
 
 ONNX_MODEL_PATHS = {
     "mejor_modelo_dinamico": PROJECT_ROOT / "modelo/mejor_modelo_dinamico.onnx",
@@ -52,7 +56,9 @@ ONNX_MODEL_PATHS = {
 OnnxModelName = Literal["mejor_modelo_dinamico", "modelo_dinamico_gab"]
 
 RESOLUTIONS    = [256, 512]          # las dos resoluciones a comparar
-MASK_THRESHOLD = 0.7                 # mismo threshold para ambas
+MASK_THRESHOLD = 0.7                 # mejor_modelo_dinamico
+GAB_MASK_THRESHOLD = petroglyph.DEFAULT_THRESHOLD
+GAB_MIN_AREA = petroglyph.DEFAULT_MIN_AREA
 OVERLAY_ALPHA  = 0.3
 
 MODEL_PATHS = {
@@ -62,6 +68,17 @@ MODEL_PATHS = {
 G_models: dict[str, torch.nn.Module | None] = {name: None for name in MODEL_PATHS}
 onnx_sessions: dict[str, ort.InferenceSession | None] = {name: None for name in ONNX_MODEL_PATHS}
 onnx_input_names: dict[str, str | None] = {name: None for name in ONNX_MODEL_PATHS}
+
+CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "modelo/best_model_fine.pth"
+CLASSIFIER_IMG_SIZE = 128
+CLASS_NAMES = ["Petroglifo", "Pictograma"]
+classifier_model: torch.nn.Module | None = None
+classifier_transform = transforms.Compose([
+    transforms.Resize((CLASSIFIER_IMG_SIZE, CLASSIFIER_IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -96,14 +113,48 @@ def get_generator(model_name: str) -> torch.nn.Module:
         )
     return G
 
-def load_onnx_session(model_path: Path) -> tuple[ort.InferenceSession, str]:
-    providers = ort.get_available_providers()
-    session = ort.InferenceSession(
-        str(model_path),
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        if "CUDAExecutionProvider" in providers else ["CPUExecutionProvider"],
+def build_onnx_providers() -> list[str | tuple[str, dict]]:
+    """Prioridad: NVIDIA (CUDA) → GPU Windows (DirectML) → CPU."""
+    available = set(ort.get_available_providers())
+    providers: list[str | tuple[str, dict]] = []
+    if "CUDAExecutionProvider" in available:
+        providers.append(("CUDAExecutionProvider", {"device_id": 0}))
+    elif "DmlExecutionProvider" in available:
+        providers.append("DmlExecutionProvider")
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
+def load_onnx_session(model_path: Path) -> tuple[ort.InferenceSession, str, str]:
+    session = ort.InferenceSession(str(model_path), providers=build_onnx_providers())
+    return session, session.get_inputs()[0].name, session.get_providers()[0]
+
+def load_classifier(model_path: Path) -> torch.nn.Module:
+    model = timm.create_model(
+        "efficientnet_b0",
+        pretrained=False,
+        num_classes=len(CLASS_NAMES),
     )
-    return session, session.get_inputs()[0].name
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    return model.to(device).eval()
+
+
+def classify_image(img: PIL.Image.Image) -> tuple[str, float, dict[str, float]]:
+    if classifier_model is None:
+        raise HTTPException(status_code=500, detail="Modelo de clasificación no cargado")
+    tensor = classifier_transform(img.convert("RGB")).unsqueeze(0).to(device)
+    with torch.no_grad():
+        outputs = classifier_model(tensor)
+        probs = torch.softmax(outputs, dim=1).squeeze()
+    idx = int(torch.argmax(probs).item())
+    clase = CLASS_NAMES[idx]
+    confianza = float(probs[idx].item())
+    probabilidades = {
+        CLASS_NAMES[i]: round(float(probs[i].item()), 4) for i in range(len(CLASS_NAMES))
+    }
+    return clase, confianza, probabilidades
+
 
 def get_onnx_session(model_name: str) -> tuple[ort.InferenceSession, str]:
     if model_name not in ONNX_MODEL_PATHS:
@@ -216,58 +267,136 @@ def simular_desgaste_poroso(resultado_pil, mascara_np, fondo_pil,
     return PIL.Image.fromarray(composicion.astype(np.uint8))
 
 # =========
-# Pipeline ONNX  (reemplaza inferir_y_simular con Keras)
+# Pipeline ONNX
 # =========
-def inferir_y_simular_onnx(img_rgb: np.ndarray, img_size: int,
-                            threshold: float, label: str,
-                            model_name: str):
-    """
-    Misma firma de salida que el inferir_y_simular original:
-        mask_bin (np.uint8 H×W), resultado_final (PIL.Image), cobertura (float)
-    """
+def predict_onnx_tta(
+    session: ort.InferenceSession,
+    input_name: str,
+    img_pre: np.ndarray,
+) -> np.ndarray:
+    def pred(x: np.ndarray) -> np.ndarray:
+        batch = np.expand_dims(x.astype(np.float32), axis=0)
+        return session.run(None, {input_name: batch})[0][0, :, :, 0]
+
+    return np.mean([
+        pred(img_pre),
+        np.fliplr(pred(np.fliplr(img_pre))),
+        np.flipud(pred(np.flipud(img_pre))),
+        np.fliplr(np.flipud(pred(np.fliplr(np.flipud(img_pre))))),
+    ], axis=0)
+
+
+def paste_on_fondo(
+    rendered_rgb: np.ndarray,
+    w_orig: int,
+    h_orig: int,
+    ruta_fondo: Path = RUTA_FONDO,
+) -> PIL.Image.Image:
+    fondo_pil = PIL.Image.open(ruta_fondo).convert("RGB")
+    target_w, target_h = fondo_pil.size
+    scale = min(target_w / w_orig, target_h / h_orig)
+    new_w, new_h = int(round(w_orig * scale)), int(round(h_orig * scale))
+    rendered_pil = PIL.Image.fromarray(rendered_rgb).resize((new_w, new_h), PIL.Image.LANCZOS)
+    lienzo = fondo_pil.copy()
+    lienzo.paste(rendered_pil, ((target_w - new_w) // 2, (target_h - new_h) // 2))
+    return lienzo
+
+
+def inferir_mejor_modelo_onnx(
+    img_rgb: np.ndarray,
+    img_size: int,
+    threshold: float,
+    label: str,
+    model_name: str,
+) -> tuple[np.ndarray, PIL.Image.Image, float]:
     onnx_session, onnx_input_name = get_onnx_session(model_name)
     h_orig, w_orig = img_rgb.shape[:2]
 
-    # ── Inferencia ONNX ───────────────────────────────────────────────────
     img_resized = cv2.resize(img_rgb, (img_size, img_size))
-    batch       = np.expand_dims(img_resized.astype(np.float32) / 255.0, axis=0)
-    output      = onnx_session.run(None, {onnx_input_name: batch})[0]
-    prob        = output[0, :, :, 0]                           # (img_size, img_size)
+    batch = np.expand_dims(img_resized.astype(np.float32) / 255.0, axis=0)
+    output = onnx_session.run(None, {onnx_input_name: batch})[0]
+    prob = output[0, :, :, 0]
 
     prob_full = cv2.resize(prob, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-    mask_bin  = (prob_full > threshold).astype(np.uint8)
-    mask_bw   = (prob > threshold).astype(np.uint8) * 255     # tamaño del modelo
+    mask_bin = (prob_full > threshold).astype(np.uint8)
+    mask_bw = (prob > threshold).astype(np.uint8) * 255
 
-    # ── Escalar máscara al tamaño del fondo ──────────────────────────────
-    mascara_pil        = PIL.Image.fromarray(mask_bw)
-    fondo_pil          = PIL.Image.open(RUTA_FONDO).convert("RGB")
+    mascara_pil = PIL.Image.fromarray(mask_bw)
+    fondo_pil = PIL.Image.open(RUTA_FONDO).convert("RGB")
     target_w, target_h = fondo_pil.size
-    scale              = min(target_w / w_orig, target_h / h_orig)
-    new_w, new_h       = int(round(w_orig * scale)), int(round(h_orig * scale))
-    mascara_resized    = mascara_pil.resize((new_w, new_h), PIL.Image.LANCZOS)
-    lienzo             = PIL.Image.new("L", (target_w, target_h), 0)
+    scale = min(target_w / w_orig, target_h / h_orig)
+    new_w, new_h = int(round(w_orig * scale)), int(round(h_orig * scale))
+    mascara_resized = mascara_pil.resize((new_w, new_h), PIL.Image.LANCZOS)
+    lienzo = PIL.Image.new("L", (target_w, target_h), 0)
     lienzo.paste(mascara_resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
-    mascara_np         = np.array(lienzo)
+    mascara_np = np.array(lienzo)
 
-    # ── Simulación (idéntica al original) ────────────────────────────────
-    resultado_pil = aplicar_tono_color_pil(fondo_pil, mascara_np,
-                                            intensidad=0.7,
-                                            color_objetivo=(0.35, 0.30, 0.80))
-    resultado_final = simular_desgaste_poroso(resultado_pil, mascara_np, fondo_pil,
-                                               intensidad_desgaste=0.50,
-                                               intensidad_porosidad=0.10,
-                                               intensidad_rugosidad=0.25,
-                                               seed=42)
+    resultado_pil = aplicar_tono_color_pil(
+        fondo_pil, mascara_np, intensidad=0.7, color_objetivo=(0.35, 0.30, 0.80),
+    )
+    resultado_final = simular_desgaste_poroso(
+        resultado_pil, mascara_np, fondo_pil,
+        intensidad_desgaste=0.50,
+        intensidad_porosidad=0.10,
+        intensidad_rugosidad=0.25,
+        seed=42,
+    )
     cobertura = mask_bin.mean() * 100
     print(f"[{label}] res={img_size} | Cobertura: {cobertura:.2f}% | Threshold: {threshold}")
     return mask_bin, resultado_final, cobertura
+
+
+def inferir_gab_onnx(
+    img_rgb: np.ndarray,
+    img_size: int,
+    threshold: float,
+    label: str,
+    model_name: str,
+) -> tuple[np.ndarray, PIL.Image.Image, float]:
+    onnx_session, onnx_input_name = get_onnx_session(model_name)
+    h_orig, w_orig = img_rgb.shape[:2]
+
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    img_pre = petroglyph.preprocess(img_bgr, img_size)
+    probability = predict_onnx_tta(onnx_session, onnx_input_name, img_pre)
+
+    selected_mask = petroglyph.select_best_mask(probability, threshold, GAB_MIN_AREA)
+    filled_mask = selected_mask["mask"]
+    metrics = selected_mask["metrics"]
+
+    prob_full = cv2.resize(probability, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+    mask_full = cv2.resize(filled_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+    mask_bin = (mask_full > 127).astype(np.uint8)
+
+    background_rgb, _ = petroglyph.choose_background(RUTA_FONDO_GAB, img_size)
+    rendered_rgb = petroglyph.render_petroglyph(background_rgb, filled_mask)
+    resultado_final = paste_on_fondo(rendered_rgb, w_orig, h_orig, RUTA_FONDO_GAB)
+
+    cobertura = float(metrics["area_percent"])
+    print(
+        f"[{label}] res={img_size} | Cobertura: {cobertura:.2f}% | "
+        f"Threshold: {selected_mask['threshold']} | Estrategia: {selected_mask['strategy']}"
+    )
+    return mask_bin, resultado_final, cobertura
+
+
+def inferir_y_simular_onnx(
+    img_rgb: np.ndarray,
+    img_size: int,
+    threshold: float,
+    label: str,
+    model_name: str,
+) -> tuple[np.ndarray, PIL.Image.Image, float]:
+    if model_name == "modelo_dinamico_gab":
+        return inferir_gab_onnx(img_rgb, img_size, threshold, label, model_name)
+    return inferir_mejor_modelo_onnx(img_rgb, img_size, threshold, label, model_name)
 
 # =========
 # Startup
 # =========
 @app.on_event("startup")
 async def startup_event():
-    global G_models, onnx_sessions, onnx_input_names
+    global G_models, onnx_sessions, onnx_input_names, classifier_model
 
     for name, path in MODEL_PATHS.items():
         print(f"Cargando modelo GAN '{name}' desde {path} ...")
@@ -277,22 +406,35 @@ async def startup_event():
         except Exception as e:
             print(f"Error cargando el modelo GAN '{name}': {e}")
 
-    if not RUTA_FONDO.is_file():
-        raise FileNotFoundError(f"No existe el archivo: {RUTA_FONDO}")
+    for ruta_fondo in (RUTA_FONDO, RUTA_FONDO_GAB):
+        if not ruta_fondo.is_file():
+            raise FileNotFoundError(f"No existe el archivo: {ruta_fondo}")
 
-    providers = ort.get_available_providers()
-    device_label = "GPU" if "CUDAExecutionProvider" in providers else "CPU"
+    print(f"ONNX Runtime — proveedores disponibles: {ort.get_available_providers()}")
     for name, path in ONNX_MODEL_PATHS.items():
         if not path.is_file():
             raise FileNotFoundError(f"No existe el archivo: {path}")
         print(f"Cargando modelo ONNX '{name}' desde {path} ...")
         try:
-            session, input_name = load_onnx_session(path)
+            session, input_name, active_provider = load_onnx_session(path)
             onnx_sessions[name] = session
             onnx_input_names[name] = input_name
-            print(f"Modelo ONNX '{name}' cargado | input: '{input_name}' | {device_label}")
+            print(
+                f"Modelo ONNX '{name}' cargado | input: '{input_name}' | "
+                f"inferencia en: {active_provider}"
+            )
         except Exception as e:
             print(f"Error cargando el modelo ONNX '{name}': {e}")
+
+    if not CLASSIFIER_MODEL_PATH.is_file():
+        print(f"Advertencia: no existe el modelo de clasificación: {CLASSIFIER_MODEL_PATH}")
+    else:
+        print(f"Cargando modelo de clasificación desde {CLASSIFIER_MODEL_PATH} ...")
+        try:
+            classifier_model = load_classifier(CLASSIFIER_MODEL_PATH)
+            print(f"Modelo de clasificación cargado en {device}.")
+        except Exception as e:
+            print(f"Error cargando el modelo de clasificación: {e}")
 
 # =========
 # Endpoints GAN  (sin cambios)
@@ -332,6 +474,39 @@ async def generate_several(image: Image):
             "model": image.model}
 
 # =========
+# /clasificar  — Petroglifo vs Pictograma (EfficientNet)
+# =========
+@app.post("/clasificar")
+async def clasificar_imagen(imagen: UploadFile = File(...)):
+    nombre = imagen.filename or ""
+    if not nombre.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo debe ser una imagen (png, jpg, jpeg, bmp, webp).",
+        )
+
+    file_bytes = await imagen.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="El archivo está vacío.")
+
+    try:
+        img_rgb = read_image_rgb(file_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    clase, confianza, probabilidades = classify_image(PIL.Image.fromarray(img_rgb))
+
+    return {
+        "filename": nombre,
+        "clase": clase,
+        "confianza": round(confianza, 4),
+        "confianza_porcentaje": round(confianza * 100, 2),
+        "alta_confianza": confianza >= 0.75,
+        "probabilidades": probabilidades,
+        "clases": CLASS_NAMES,
+    }
+
+# =========
 # /comparar  — ahora compara 256×256 vs 512×512 con el modelo ONNX
 # =========
 @app.post("/comparar")
@@ -353,12 +528,16 @@ async def comparar_modelos(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    seg_threshold = (
+        MASK_THRESHOLD if model == "mejor_modelo_dinamico" else GAB_MASK_THRESHOLD
+    )
+
     # ── Inferencia con ambas resoluciones ────────────────────────────────
     mask_1, resultado_1, cob_1 = inferir_y_simular_onnx(
-        img_rgb, img_size=256, threshold=MASK_THRESHOLD, label="256×256",
+        img_rgb, img_size=256, threshold=seg_threshold, label="256×256",
         model_name=model)
     mask_2, resultado_2, cob_2 = inferir_y_simular_onnx(
-        img_rgb, img_size=512, threshold=MASK_THRESHOLD, label="512×512",
+        img_rgb, img_size=512, threshold=seg_threshold, label="512×512",
         model_name=model)
 
     # ── Figura comparación 2×3  (layout idéntico al original) ────────────
@@ -383,8 +562,8 @@ async def comparar_modelos(
         "metricas": {
             "cobertura_modelo_1": round(cob_1, 4),   # resolución 256
             "cobertura_modelo_2": round(cob_2, 4),   # resolución 512
-            "threshold_modelo_1": MASK_THRESHOLD,
-            "threshold_modelo_2": MASK_THRESHOLD,
+            "threshold_modelo_1": seg_threshold,
+            "threshold_modelo_2": seg_threshold,
         },
         "imagenes": {
             "comparacion":         img_comparacion,
