@@ -69,8 +69,8 @@ G_models: dict[str, torch.nn.Module | None] = {name: None for name in MODEL_PATH
 onnx_sessions: dict[str, ort.InferenceSession | None] = {name: None for name in ONNX_MODEL_PATHS}
 onnx_input_names: dict[str, str | None] = {name: None for name in ONNX_MODEL_PATHS}
 
-CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "modelo/best_model_fine.pth"
-CLASSIFIER_IMG_SIZE = 128
+CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "modelo/best_model_fine_mobilenet.pth"
+CLASSIFIER_IMG_SIZE = 256
 CLASS_NAMES = ["Petroglifo", "Pictograma"]
 classifier_model: torch.nn.Module | None = None
 classifier_transform = transforms.Compose([
@@ -131,7 +131,7 @@ def load_onnx_session(model_path: Path) -> tuple[ort.InferenceSession, str, str]
 
 def load_classifier(model_path: Path) -> torch.nn.Module:
     model = timm.create_model(
-        "efficientnet_b0",
+        "mobilenetv3_small_100",
         pretrained=False,
         num_classes=len(CLASS_NAMES),
     )
