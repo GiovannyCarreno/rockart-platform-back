@@ -21,6 +21,7 @@ RUN grep -vE '^(torch|torchvision|torchaudio)' requirements.txt > requirements-d
 # Copiar código de la aplicación
 COPY legacy.py .
 COPY service.py .
+COPY segmentar_petroglifo.py .
 COPY dnnlib/ ./dnnlib/
 COPY torch_utils/ ./torch_utils/
 COPY modelo/ ./modelo/
