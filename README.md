@@ -1,4 +1,4 @@
-# API pic-generator-back
+# API rockart-platform-back
 
 Servicio REST con **FastAPI** que integra generación, segmentación y clasificación de arte rupestre:
 
@@ -210,7 +210,7 @@ En el repo, `client.py` es un ejemplo mínimo que llama a `/comparar`.
 ## Estructura del proyecto
 
 ```
-pic-generator-back/
+rockart-platform-back/
 ├── service.py              # FastAPI: endpoints y orquestación
 ├── segmentar_petroglifo.py # Postprocesado de segmentación (modelo GAB)
 ├── legacy.py               # Carga de checkpoints StyleGAN2 (.pkl)
