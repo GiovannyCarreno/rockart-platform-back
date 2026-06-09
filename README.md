@@ -271,3 +271,7 @@ rockart-platform-back/
 - **IOPaint** — inpainting con modelo LaMa (servicio web en puerto 8080).
 
 Código y modelo GAN sujetos a la licencia de **StyleGAN2 ADA**; ver `LICENSE.txt`.
+
+## Link repositorio del frontend
+
+- https://github.com/GiovannyCarreno/rockart-platform-front
