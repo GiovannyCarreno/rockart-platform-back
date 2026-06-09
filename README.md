@@ -63,6 +63,7 @@ python -m venv .venv
 ```bash
 pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
+pip install iopaint==1.6.0
 ```
 
 > En CPU sin NVIDIA puedes usar solo `onnxruntime` (sin `-gpu`). El código intenta `CUDAExecutionProvider`, luego `DmlExecutionProvider` (Windows) y cae a CPU.
