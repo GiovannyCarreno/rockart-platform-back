@@ -5,6 +5,7 @@ Servicio REST con **FastAPI** que integra generación, segmentación y clasifica
 1. **Generación de pictogramas** con **StyleGAN2 (ADA)** (PyTorch).
 2. **Segmentación y simulación visual** con modelos **ONNX** a 256×256 y 512×512.
 3. **Clasificación** Petroglifo / Pictograma con **MobileNetV3** (timm).
+4. **Inpainting** con **[IOPaint](https://github.com/Sanster/IOPaint)** (modelo **LaMa**) en un servicio web independiente.
 
 ## Características
 
@@ -18,6 +19,7 @@ Servicio REST con **FastAPI** que integra generación, segmentación y clasifica
 - **Selección de modelo** en generación (`pictos512`, `pictos512_2`) y segmentación (`mejor_modelo_dinamico`, `modelo_dinamico_gab`).
 - **GPU**: PyTorch (GAN y clasificador) y ONNX Runtime (CUDA → DirectML → CPU).
 - **CORS** configurado para `http://localhost:5174` (ajústalo en `service.py` si tu front usa otro origen).
+- **IOPaint** (puerto **8080**): interfaz web para inpainting con LaMa; se instala con `requirements.txt` (`iopaint`).
 
 ## Requisitos previos
 
@@ -75,6 +77,26 @@ uvicorn service:app --reload --host 0.0.0.0 --port 8000
 
 Al iniciar, la consola indica qué modelos se cargaron y qué proveedor ONNX se usa (p. ej. `CUDAExecutionProvider`).
 
+### IOPaint (inpainting LaMa)
+
+IOPaint es un **segundo servicio** en el puerto **8080**. Tras instalar dependencias (`pip install -r requirements.txt` ya incluye `iopaint`), inícialo en otra terminal:
+
+**Con GPU (CUDA):**
+
+```bash
+iopaint start --model=lama --device=cuda --host=0.0.0.0 --port=8080
+```
+
+**Solo CPU:**
+
+```bash
+iopaint start --model=lama --device=cpu --host=0.0.0.0 --port=8080
+```
+
+Abre **http://localhost:8080** en el navegador. La primera vez descarga el modelo LaMa automáticamente.
+
+> La API FastAPI (`uvicorn` en 8000) e IOPaint (8080) son procesos independientes en ejecución local. En Docker ambos arrancan juntos (ver sección Docker).
+
 ## Docker
 
 Requisitos: [Docker](https://docs.docker.com/get-docker/) y, para GPU, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
@@ -91,21 +113,32 @@ Construir sin caché:
 docker build --no-cache -t pictos-gan-api .
 ```
 
+El contenedor levanta **dos servicios**:
+
+| Puerto | Servicio |
+|--------|----------|
+| **8000** | API FastAPI (`uvicorn service:app`) |
+| **8080** | IOPaint LaMa (`iopaint start --model=lama`) |
+
 Ejecutar:
 
 ```bash
-# Con GPU
-docker run --gpus all -p 8000:8000 pictos-gan-api
+# Con GPU (IOPaint usa CUDA por defecto)
+docker run --gpus all -p 8000:8000 -p 8080:8080 pictos-gan-api
 
-# Solo CPU
-docker run -p 8000:8000 pictos-gan-api
+# Solo CPU (IOPaint en CPU vía variable de entorno)
+docker run -p 8000:8000 -p 8080:8080 -e IOPAINT_DEVICE=cpu pictos-gan-api
 ```
 
 Montar modelos o fondos desde el host:
 
 ```bash
-docker run --gpus all -p 8000:8000 -v ./modelo:/app/modelo -v ./roca:/app/roca pictos-gan-api
+docker run --gpus all -p 8000:8000 -p 8080:8080 \
+  -v ./modelo:/app/modelo -v ./roca:/app/roca pictos-gan-api
 ```
+
+- API: **http://localhost:8000** (docs en `/docs`)
+- IOPaint: **http://localhost:8080**
 
 ## Endpoints
 
@@ -219,6 +252,7 @@ rockart-platform-back/
 ├── torch_utils/            # Utilidades PyTorch (StyleGAN2)
 ├── modelo/                 # Pesos (.pkl, .onnx, .pth)
 ├── roca/                   # Fondos para simulación
+├── docker-entrypoint.sh  # Arranque conjunto FastAPI + IOPaint (Docker)
 ├── Dockerfile
 ├── .dockerignore
 ├── .gitattributes          # Git LFS (*.pkl, *.onnx, etc.)
@@ -234,5 +268,6 @@ rockart-platform-back/
 - **ONNX Runtime** — segmentación (CUDA / DirectML / CPU).
 - **OpenCV**, **Pillow**, **NumPy**, **SciPy**, **scikit-image** — imagen y postprocesado.
 - **Matplotlib** — figura de comparación en `/comparar`.
+- **IOPaint** — inpainting con modelo LaMa (servicio web en puerto 8080).
 
 Código y modelo GAN sujetos a la licencia de **StyleGAN2 ADA**; ver `LICENSE.txt`.
